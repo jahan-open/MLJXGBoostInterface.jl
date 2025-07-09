@@ -88,6 +88,7 @@ function modelexpr(name::Symbol, absname::Symbol, obj::AbstractString, objvalida
             tweedie_variance_power::Float64 = 1.5::(1 < _ < 2)
             objective = $obj :: $objvalidate(_)
             base_score::Float64 = 0.5
+            early_stopping_rounds::Int = 0::(_ ≥ 0)
             watchlist = nothing  # if this is nothing we will not pass it so as to use default
             nthread::Int = Base.Threads.nthreads()::(_ ≥ 0)
             importance_type::String = "gain"
@@ -96,6 +97,7 @@ function modelexpr(name::Symbol, absname::Symbol, obj::AbstractString, objvalida
             # but in the meantime, let's just disable checking
             validate_parameters::Bool = false
             eval_metric::Vector{String} = String[]
+            monotone_constraints::Union{Nothing,String} = nothing
         end
 
     end
@@ -108,13 +110,21 @@ function kwargs(model, verbosity, obj)
     excluded = [:importance_type]
     fn = filter(∉(excluded), fieldnames(typeof(model)))
     out = NamedTuple(n=>getfield(model, n) for n ∈ fn if !isnothing(getfield(model, n)))
-    out = merge(out, (silent=(verbosity ≤ 0),))
-    # watchlist is for log output, so override if it's default and verbosity ≤ 0
-    wl = (verbosity ≤ 0 && isnothing(model.watchlist)) ? (;) : model.watchlist
-    if !isnothing(wl)
-        out = merge(out, (watchlist=wl,))
+
+    # `watchlist` needs to be consistent with `verbosity`. If you don't pass
+    # `watchlist=(;)` in the case of unspecified `watchlist`, then logging will happen no
+    # matter what the value of `verbosity`!
+    watchlist = (verbosity ≤ 0 && isnothing(model.watchlist)) ? (;) : model.watchlist
+    if !isnothing(watchlist)
+        out = merge(out, (; watchlist))
     end
-    out = merge(out, (objective=_fix_objective(obj),))
+
+    # need `0 ≤ verbosity ≤ 3`:
+    verbosity = min(max(verbosity, 0), 3)
+
+    objective=_fix_objective(obj)
+    out = merge(out, (; verbosity, objective))
+
     return out
 end
 
@@ -136,15 +146,19 @@ function _feature_names(X, dmatrix)
     end
 end
 
-function MMI.fit(model::XGBoostAbstractRegressor, verbosity::Integer, X, y)
-    dm = DMatrix(MMI.matrix(X), float(y))
+function MMI.fit(model::XGBoostAbstractRegressor, verbosity::Integer, X, y, weight=nothing)
+    dm = if isnothing(weight)
+        DMatrix(MMI.matrix(X), float(y))
+    else
+        DMatrix(MMI.matrix(X), float(y); weight = weight)
+    end
     b = xgboost(dm; kwargs(model, verbosity, model.objective)...)
     # first return value is a tuple for consistancy with classifier case
     ((b, nothing), nothing, (features=_feature_names(X, dm),))
 end
 
-MMI.predict(model::XGBoostAbstractRegressor, (booster, _), Xnew) = XGB.predict(booster, Xnew)
-
+MMI.predict(model::XGBoostAbstractRegressor, (booster, _), Xnew) = XGB.predict(booster, Xnew, 
+    ntree_limit = !ismissing(booster.best_iteration) ? booster.best_iteration : 0)
 
 eval(modelexpr(:XGBoostCount, :XGBoostAbstractRegressor, "count:poisson", :validate_count_objective))
 
@@ -153,7 +167,7 @@ eval(modelexpr(:XGBoostClassifier, :XGBoostAbstractClassifier, "automatic", :val
 
 function MMI.fit(model::XGBoostClassifier,
                  verbosity,  # must be here even if unsupported in pkg
-                 X, y,
+                 X, y, weight=nothing
                 )
     a_target_element = y[1] # a CategoricalValue or CategoricalString
     nclass = length(MMI.classes(a_target_element))
@@ -163,7 +177,11 @@ function MMI.fit(model::XGBoostClassifier,
     num_class = nclass == 2 ? (;) : (num_class=nclass,)
 
     # libxgboost wants float labels
-    dm = DMatrix(MMI.matrix(X), float(MMI.int(y) .- 1))
+    dm = if isnothing(weight)
+        DMatrix(MMI.matrix(X), float(MMI.int(y) .- 1))
+    else
+        DMatrix(MMI.matrix(X), float(MMI.int(y) .- 1); weight = weight)
+    end
 
     b = xgboost(dm; kwargs(model, verbosity, objective)..., num_class...)
     fr = (b, a_target_element)
@@ -174,7 +192,8 @@ end
 function MMI.predict(model::XGBoostClassifier, fitresult, Xnew)
     (result, a_target_element) = fitresult
     classes = MMI.classes(a_target_element)
-    o = XGB.predict(result, MMI.matrix(Xnew))
+    # we can utilise the best iteration based off early stopping rounds
+    o = XGB.predict(result, MMI.matrix(Xnew), ntree_limit = !ismissing(result.best_iteration) ? result.best_iteration : 0)
 
     # XGB can return a rank-1 array for binary classification
     MMI.UnivariateFinite(classes, o, augment=ndims(o)==1)
@@ -192,8 +211,8 @@ MMI.save(::XGTypes, fr; kw...) = (_save(fr[1]; kw...), fr[2])
 
 MMI.restore(::XGTypes, fr) = (_restore(fr[1]), fr[2])
 
-MLJModelInterface.reports_feature_importances(::Type{<:XGBoostAbstractRegressor}) = true
-MLJModelInterface.reports_feature_importances(::Type{<:XGBoostAbstractClassifier}) = true
+MMI.reports_feature_importances(::Type{<:XGBoostAbstractRegressor}) = true
+MMI.reports_feature_importances(::Type{<:XGBoostAbstractClassifier}) = true
 
 
 MMI.package_name(::Type{<:XGTypes}) = "XGBoost"
@@ -215,6 +234,8 @@ MMI.load_path(::Type{<:XGBoostClassifier}) = "$PKG.XGBoostClassifier"
 MMI.input_scitype(::Type{<:XGBoostClassifier}) = Table(Continuous)
 MMI.target_scitype(::Type{<:XGBoostClassifier}) = AbstractVector{<:Finite}
 MMI.human_name(::Type{<:XGBoostClassifier}) = "eXtreme Gradient Boosting Classifier"
+MMI.supports_weights(::Type{<:XGBoostRegressor}) = true
+MMI.supports_weights(::Type{<:XGBoostClassifier}) = true
 
 
 include("docstrings.jl")

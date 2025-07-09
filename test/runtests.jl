@@ -4,8 +4,8 @@ import XGBoost
 using MLJXGBoostInterface
 using MLJTestInterface
 using Distributions
-import StableRNGs
-const rng = StableRNGs.StableRNG(123)
+using StableRNGs
+const rng = StableRNG(123)
 
 @test_logs (:warn, r"Constraint ") XGBoostClassifier(objective="wrong")
 @test_logs (:warn, r"Constraint ") XGBoostCount(objective="wrong")
@@ -51,6 +51,63 @@ end
 
     imps = feature_importances(plain_regressor, fitresultR, reportR)
     @test Set(string.([imp[1] for imp ∈ imps])) == Set(string.(("x",), 1:5))
+
+    # test regressor for early stopping rounds
+    # add some noise to create more differentiator in the evaluation metric to test if it chose the correct ntree_limit
+    mod_labels = labels + rand(StableRNG(123), Float64, 1000) * 10
+    es_regressor = XGBoostRegressor(num_round = 250, early_stopping_rounds = 20, eta = 0.5, max_depth = 20, 
+        eval_metric = ["mae"], watchlist = Dict("train" => XGBoost.DMatrix(features, mod_labels)))
+    (fitresultR, cacheR, reportR) = @test_logs(
+        (:info,),
+        match_mode=:any,
+        MLJBase.fit(es_regressor, 0, features, mod_labels),
+    )
+    rpred = predict(es_regressor, fitresultR, features);
+    @test abs(mean(abs.(rpred-mod_labels)) - fitresultR[1].best_score) < 1e-8
+    @test !ismissing(fitresultR[1].best_iteration)
+    
+    # try without early stopping (should be worse given the generated dataset) - to make sure it's a fair comparison - set early_stopping_rounds = num_round
+    nes_regressor = XGBoostRegressor(num_round = 250, early_stopping_rounds = 250, eta = 0.5, max_depth = 20, 
+        eval_metric = ["mae"], watchlist = Dict("train" => XGBoost.DMatrix(features, mod_labels)))
+    (fitresultR, cacheR, reportR) = @test_logs(
+        (:info,),
+        match_mode=:any,
+        MLJBase.fit(nes_regressor, 0, features, mod_labels),
+    )
+    rpred_noES = predict(es_regressor, fitresultR, features);
+    @test abs(mean(abs.(rpred-mod_labels))) < abs(mean(abs.(rpred_noES-mod_labels)))
+    @test ismissing(fitresultR[1].best_iteration)
+
+
+    # Create synthetic data with 3 features
+    n = 200
+    X = (x1 = randn(n), x2 = randn(n), x3 = randn(n))
+    
+    # Target: positively dependent on all features
+    y = 2 .* X.x1 .+ 3 .* X.x2 .+ 1.5 .* X.x3 .+ 0.1 .* randn(n)
+
+    X_tbl = MLJBase.table(X)
+
+    # Model with negative monotone constraints
+    model_neg = XGBoostRegressor(num_round=20, monotone_constraints="(-1,-1,-1)")
+    mach_neg = machine(model_neg, X_tbl, y)
+    fit!(mach_neg, verbosity=0)
+    yhat_neg = predict(mach_neg, X_tbl)
+
+    # Model with positive monotone constraints (should perform better)
+    model_pos = XGBoostRegressor(num_round=20, monotone_constraints="(1,1,1)")
+    mach_pos = machine(model_pos, X_tbl, y)
+    fit!(mach_pos, verbosity=0)
+    yhat_pos = predict(mach_pos, X_tbl)
+
+    rmse = (ŷ, y) -> sqrt(mean((ŷ .- y).^2))
+    rmse_neg = rmse(yhat_neg, y)
+    rmse_pos = rmse(yhat_pos, y)
+
+    @test rmse_neg > 2 * rmse_pos
+
+    @test mach_pos.model.monotone_constraints == "(1,1,1)"
+    @test mach_neg.model.monotone_constraints == "(-1,-1,-1)"
 end
 
 @testset "count" begin
@@ -163,6 +220,13 @@ end
     fit!(mach, verbosity=0)
     yhat = predict(mach, Xtable)
 
+    weight = rand(length(ycount))
+    mach_withweight = machine(count_regressor, Xtable, ycount, weight)
+    fit!(mach_withweight, verbosity=0)
+    yhat_withweight = predict(mach_withweight, Xtable)
+
+    @test !(yhat ≈ yhat_withweight)
+
     # serialize:
     io = IOBuffer()
     MLJBase.save(io, mach)
@@ -203,6 +267,12 @@ end
 end
 
 @testset "generic interface tests" begin
+    @testset "Default Early Stopping Params" begin
+        @test XGBoostRegressor().early_stopping_rounds == 0
+    end
+    @testset "Default monotone constraints" begin
+        @test isnothing(XGBoostRegressor().monotone_constraints)
+    end
     @testset "XGBoostRegressor" begin
         failures, summary = MLJTestInterface.test(
             [XGBoostRegressor,],
@@ -239,3 +309,4 @@ end
         end
     end
 end
+
